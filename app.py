@@ -1,9 +1,9 @@
 import os
 import io
+import base64
 import numpy as np
 
-from flask import Flask, render_template, request, jsonify, url_for
-from werkzeug.utils import secure_filename
+from flask import Flask, render_template, request, jsonify
 
 from tensorflow.keras.models import load_model
 from tensorflow.keras.utils import load_img, img_to_array
@@ -30,16 +30,6 @@ LABEL_PATH = os.path.join(
     "labels.txt"
 )
 
-UPLOAD_FOLDER = os.path.join(
-    BASE_DIR,
-    "static",
-    "uploads"
-)
-
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
 
 # ============================================================
 # LOAD MODEL MOBILENETV2
@@ -65,6 +55,7 @@ print("Model:", MODEL_PATH)
 if os.path.exists(LABEL_PATH):
 
     with open(LABEL_PATH, "r", encoding="utf-8") as file:
+
         labels = [
             line.strip()
             for line in file
@@ -96,6 +87,7 @@ print("==============================================")
 # ============================================================
 
 DISPLAY_NAMES = {
+
     "bukan_yospan": "Bukan Yospan",
 
     "gale_gale": "Gale-gale",
@@ -131,29 +123,31 @@ def format_label(label):
 # ============================================================
 # FUNGSI PREPROCESSING GAMBAR
 #
-# SESUAI DENGAN MODEL MOBILENETV2
+# Gambar diproses langsung dari memory.
+# Tidak disimpan ke static/uploads.
 #
 # Input:
-#   gambar
+#   image_bytes
 #
 # Proses:
-#   1. Resize menjadi 224 x 224
-#   2. Ubah menjadi array
-#   3. Tambahkan batch dimension
-#   4. preprocess_input MobileNetV2
+#   1. Baca gambar dari memory
+#   2. Resize menjadi 224 x 224
+#   3. Ubah menjadi NumPy array
+#   4. Tambahkan batch dimension
+#   5. preprocess_input MobileNetV2
 #
 # Output:
 #   Array dengan bentuk (1, 224, 224, 3)
 # ============================================================
 
-def preprocess_image(filepath):
+def preprocess_image(image_bytes):
 
     # --------------------------------------------------------
-    # Baca gambar dan resize menjadi 224 x 224
+    # Baca gambar langsung dari memory
     # --------------------------------------------------------
 
     image = load_img(
-        filepath,
+        io.BytesIO(image_bytes),
         target_size=(224, 224)
     )
 
@@ -195,14 +189,14 @@ def preprocess_image(filepath):
 # FUNGSI PREDIKSI
 # ============================================================
 
-def predict_image(filepath):
+def predict_image(image_bytes):
 
     # --------------------------------------------------------
     # PREPROCESSING GAMBAR
     # --------------------------------------------------------
 
     image_array = preprocess_image(
-        filepath
+        image_bytes
     )
 
     # --------------------------------------------------------
@@ -213,6 +207,16 @@ def predict_image(filepath):
         image_array,
         verbose=0
     )
+
+    # --------------------------------------------------------
+    # Pastikan output model berbentuk benar
+    # --------------------------------------------------------
+
+    if prediction.ndim != 2:
+
+        raise ValueError(
+            "Output model tidak memiliki format yang sesuai."
+        )
 
     # --------------------------------------------------------
     # Pastikan jumlah output model sesuai jumlah label
@@ -254,7 +258,7 @@ def predict_image(filepath):
     # --------------------------------------------------------
 
     is_yospan = (
-        predicted_label != "bukan_yospan"
+        predicted_label.lower() != "bukan_yospan"
     )
 
     # --------------------------------------------------------
@@ -270,6 +274,23 @@ def predict_image(filepath):
         "confidence": confidence,
         "is_yospan": is_yospan
     }
+
+
+# ============================================================
+# FUNGSI MEMBUAT DATA URL GAMBAR
+#
+# Gambar tidak disimpan ke server.
+# Gambar dikembalikan dalam bentuk data URL
+# agar frontend tetap dapat menampilkan gambar.
+# ============================================================
+
+def create_image_data_url(image_bytes, mimetype):
+
+    encoded_image = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
+
+    return f"data:{mimetype};base64,{encoded_image}"
 
 
 # ============================================================
@@ -323,8 +344,9 @@ def predict():
 
         return jsonify({
             "success": False,
+            "status": "error",
             "message": "Gambar belum dipilih."
-        })
+        }), 400
 
     file = request.files["image"]
 
@@ -336,45 +358,56 @@ def predict():
 
         return jsonify({
             "success": False,
+            "status": "error",
             "message": "Gambar belum dipilih."
-        })
-
-    # --------------------------------------------------------
-    # Amankan nama file
-    # --------------------------------------------------------
-
-    filename = secure_filename(
-        file.filename
-    )
-
-    filepath = os.path.join(
-        app.config["UPLOAD_FOLDER"],
-        filename
-    )
-
-    # --------------------------------------------------------
-    # Simpan gambar
-    # --------------------------------------------------------
-
-    file.save(filepath)
+        }), 400
 
     try:
+
+        # ----------------------------------------------------
+        # Baca file langsung ke memory
+        #
+        # TIDAK menggunakan file.save()
+        # karena filesystem Vercel bersifat read-only.
+        # ----------------------------------------------------
+
+        image_bytes = file.read()
+
+        # ----------------------------------------------------
+        # Pastikan file tidak kosong
+        # ----------------------------------------------------
+
+        if not image_bytes:
+
+            return jsonify({
+                "success": False,
+                "status": "error",
+                "message": "File gambar kosong."
+            }), 400
 
         # ----------------------------------------------------
         # Jalankan prediksi
         # ----------------------------------------------------
 
         result = predict_image(
-            filepath
+            image_bytes
         )
 
         # ----------------------------------------------------
-        # URL gambar
+        # Buat data URL gambar
+        #
+        # Ini menggantikan URL:
+        # /static/uploads/nama_file.png
+        #
+        # sehingga tidak perlu menyimpan file
+        # ke filesystem server.
         # ----------------------------------------------------
 
-        image_url = url_for(
-            "static",
-            filename=f"uploads/{filename}"
+        mimetype = file.mimetype or "image/jpeg"
+
+        image_data_url = create_image_data_url(
+            image_bytes,
+            mimetype
         )
 
         # ----------------------------------------------------
@@ -387,13 +420,19 @@ def predict():
 
                 "success": False,
 
-                "status": result["status"],
+                "status": result.get(
+                    "status",
+                    "error"
+                ),
 
-                "message": result["message"],
+                "message": result.get(
+                    "message",
+                    "Gagal melakukan klasifikasi."
+                ),
 
-                "image": image_url
+                "image": image_data_url
 
-            })
+            }), 500
 
         # ----------------------------------------------------
         # Jika prediksi berhasil
@@ -411,25 +450,33 @@ def predict():
 
             "is_yospan": result["is_yospan"],
 
-            "image": image_url
+            "image": image_data_url
 
         })
 
     except Exception as error:
 
+        # ----------------------------------------------------
+        # Tampilkan error lengkap di Vercel Runtime Logs
+        # ----------------------------------------------------
+
         print("==============================================")
         print("ERROR PREDIKSI")
-        print(error)
+        print("==============================================")
+        print(type(error).__name__)
+        print(str(error))
         print("==============================================")
 
         return jsonify({
 
             "success": False,
 
+            "status": "error",
+
             "message":
                 "Terjadi kesalahan saat melakukan klasifikasi."
 
-        })
+        }), 500
 
 
 # ============================================================
